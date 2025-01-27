@@ -1,2 +1,8 @@
-# my-rag-project
-An custom  advanced Retrieval Augmented Generation (RAG) system built with FAISS, Langchain, and vllm (for inference))
+# My RAG Project
+
+This repository demonstrates an advanced Retrieval Augmented Generation (RAG) system using:
+- [LangChain](https://github.com/hwchase17/langchain) for retrieval+LLM orchestration
+- [FAISS](https://github.com/facebookresearch/faiss) for vector indexing
+- [Hugging Face Transformers](https://github.com/huggingface/transformers) for the LLM & embeddings
+
+
