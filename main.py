@@ -35,9 +35,40 @@ from src.embeddings import get_embedding_model
 from src.indexing import build_faiss_index
 from src.reranking import get_reranker
 from src.rag_pipeline import answer_with_rag  # This function must handle a flexible "llm" callable.
-
+from langchain_community.tools import DuckDuckGoSearchResults
 import warnings
 warnings.filterwarnings("ignore")
+from typing import Any
+
+def load_models_for_web(
+    llm_model_name: str,
+    use_vllm: bool,
+    reranker_model_name: Optional[str] = None,
+    use_reranker: bool = False
+) -> Tuple[Optional[Any], Optional[Callable]]:
+    """
+    Load models needed for web search: reranker (optional) and LLM.
+    Returns:
+        (reranker, llm_inference_fn)
+    """
+    reranker = None
+    if use_reranker:
+        logging.info("Loading reranker model...")
+        if not reranker_model_name:
+            logging.warning("use_reranker=True but no model name provided. Proceeding without reranker.")
+        else:
+            from src.reranking import get_reranker
+            reranker = get_reranker(reranker_model_name)
+
+    # Load LLM
+    if use_vllm:
+        if LLM is None or SamplingParams is None:
+            raise ImportError("vLLM is not installed. Please install with 'pip install vllm'.")
+        llm_inference_fn = get_vllm_inference_fn(llm_model_name)
+    else:
+        llm_inference_fn = get_hf_pipeline_llm(llm_model_name)
+
+    return reranker, llm_inference_fn
 
 def parse_args() -> argparse.Namespace:
     """
@@ -101,6 +132,11 @@ def parse_args() -> argparse.Namespace:
         "--use_vllm",
         action="store_true",
         help="If set, use vLLM for faster inference instead of HF pipeline."
+    )
+    parser.add_argument(
+        "--web",
+        action="store_true",
+        help="Use web search instead of the dataset for retrieval."
     )
     return parser.parse_args()
 
@@ -304,43 +340,98 @@ def main() -> None:
     logging.info("Starting RAG pipeline...")
 
     # 1. Load data and split into chunks
-    docs_processed = load_and_process_documents(
-        dataset_path=args.dataset_path,
-        split=args.split,
-        embedding_model_name=args.embedding_model_name,
-    )
+    if args.web:
+        logging.info("Using web search for retrieval.")
+        try:
+            from langchain_community.tools import DuckDuckGoSearchResults
+            from langchain_community.utilities import DuckDuckGoSearchAPIWrapper
+        except ImportError:
+            logging.error("Web search requires 'langchain-community' and 'duckduckgo-search'. Install with:")
+            logging.error("pip install langchain-community duckduckgo-search")
+            sys.exit(1)
 
-    # 2. Load models (embedding, reranker, LLM callable)
-    embedding_model, reranker, llm_inference_fn = load_models(
-        embedding_model_name=args.embedding_model_name,
-        llm_model_name=args.llm_model_name,
-        use_vllm=args.use_vllm,
-        reranker_model_name=args.reranker_model_name,
-        use_reranker=args.use_reranker
-    )
+        # Load models needed for web search
+        reranker, llm_inference_fn = load_models_for_web(
+            llm_model_name=args.llm_model_name,
+            use_vllm=args.use_vllm,
+            reranker_model_name=args.reranker_model_name if args.use_reranker else None,
+            use_reranker=args.use_reranker
+        )
 
-    # 3. Build FAISS index
-    logging.info("Building FAISS index...")
-    knowledge_db = build_faiss_index(docs_processed, embedding_model)
+        # Perform web search
+        wrapper = DuckDuckGoSearchAPIWrapper(
+            max_results=args.num_retrieved_docs,
+            backend="web"
+        )
+        search = DuckDuckGoSearchResults(
+            api_wrapper=wrapper,
+            output_format="list"
+        )
+        search_results = search.invoke(args.question)
 
-    logging.info(f"Querying for question: {args.question}")
+        # Process into documents with 'content'
+        processed_docs = [
+            {'content': f"Title: {doc['title']}\nSnippet: {doc['snippet']}\nLink: {doc['link']}"}
+            for doc in search_results
+        ]
 
-    # 4. Run RAG pipeline.
-    #    NOTE: 'answer_with_rag' must accept a callable "llm" that is invoked with a string prompt.
-    answer, used_docs = answer_with_rag(
-        question=args.question,
-        llm=llm_inference_fn,         # <--- We pass our function instead of a HF pipeline object
-        knowledge_index=knowledge_db,
-        use_reranker=args.use_reranker,
-        reranker=reranker,
-        num_retrieved_docs=args.num_retrieved_docs,
-        num_docs_final=args.num_docs_final
-    )
+        # Rerank if applicable
+        if args.use_reranker and reranker is not None:
+            doc_contents = [doc['content'] for doc in processed_docs]
+            reranked_indices = reranker.rerank(args.question, doc_contents, top_k=args.num_docs_final)
+            used_docs = [processed_docs[i] for i in reranked_indices]
+        else:
+            used_docs = processed_docs[:args.num_docs_final]
 
-    # 5. Print result
-    logging.info("\n" + "=" * 25 + " RAG Answer " + "=" * 25)
-    logging.info(f"{answer}")
-    logging.info("=" * 63)
+        # Generate answer using LLM
+        context = "\n\n".join([doc['content'] for doc in used_docs])
+        prompt = (
+            f"Question: {args.question}\n"
+            f"Context: {context}\n"
+            "Answer the question based on the context. If unsure, state so."
+        )
+        answer = llm_inference_fn(prompt)
+
+        logging.info("\n" + "=" * 25 + " Web Search Answer " + "=" * 25)
+        logging.info(f"{answer}")
+        logging.info("=" * 63)
+
+    else:
+        # Original RAG pipeline
+        docs_processed = load_and_process_documents(
+            dataset_path=args.dataset_path,
+            split=args.split,
+            embedding_model_name=args.embedding_model_name,
+        )
+
+        # Load models (embedding, reranker, LLM)
+        embedding_model, reranker, llm_inference_fn = load_models(
+            embedding_model_name=args.embedding_model_name,
+            llm_model_name=args.llm_model_name,
+            use_vllm=args.use_vllm,
+            reranker_model_name=args.reranker_model_name,
+            use_reranker=args.use_reranker
+        )
+
+        # Build FAISS index
+        logging.info("Building FAISS index...")
+        knowledge_db = build_faiss_index(docs_processed, embedding_model)
+
+        # Run RAG pipeline
+        answer, used_docs = answer_with_rag(
+            question=args.question,
+            llm=llm_inference_fn,
+            knowledge_index=knowledge_db,
+            use_reranker=args.use_reranker,
+            reranker=reranker,
+            num_retrieved_docs=args.num_retrieved_docs,
+            num_docs_final=args.num_docs_final
+        )
+
+        # Print result
+        logging.info("\n" + "=" * 25 + " RAG Answer " + "=" * 25)
+        logging.info(f"{answer}")
+        logging.info("=" * 63)
 
     # If you want to see the final doc chunks used:
     # for i, doc in enumerate(used_docs):
