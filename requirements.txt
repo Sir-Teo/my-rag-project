@@ -11,3 +11,4 @@ pacmap
 datasets
 langchain-community
 ragatouille
+gradio

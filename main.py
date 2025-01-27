@@ -123,7 +123,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--num_docs_final",
         type=int,
-        default=4,
+        default=10,
         help="Number of documents to use after optional reranking."
     )
     parser.add_argument(
@@ -220,7 +220,7 @@ def get_vllm_inference_fn(
 def get_hf_pipeline_llm(
     llm_model_name: str,
     temperature: float = 0.2,
-    max_new_tokens: int = 500,
+    max_new_tokens: int = 1024,
     repetition_penalty: float = 1.1
 ) -> Callable[[str], str]:
     """
@@ -353,7 +353,8 @@ def main() -> None:
             
             # Perform web search
             search = DuckDuckGoSearchResults(
-                output_format="list"
+                output_format="list",
+                max_results=args.num_retrieved_docs,
             )
 
             search_results = search.invoke(args.question)
