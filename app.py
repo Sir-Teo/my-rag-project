@@ -3,6 +3,7 @@ import time
 import logging
 import sys
 from typing import Optional, Callable
+import torch
 
 # Local imports from main.py and src/
 from main import (
