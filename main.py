@@ -123,7 +123,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--num_docs_final",
         type=int,
-        default=5,
+        default=4,
         help="Number of documents to use after optional reranking."
     )
     parser.add_argument(
@@ -381,7 +381,7 @@ def main() -> None:
                         logging.warning("Reranker returned no results. Using original retrieved docs.")
                         used_docs = processed_docs[:args.num_docs_final]
                     else:
-                        reranked_indices = [result.document_id for result in reranked_results]
+                        reranked_indices = [result['rank'] for result in reranked_results]
                         used_docs = [processed_docs[i] for i in reranked_indices]
             else:  # Handle case when reranker is not used
                 used_docs = processed_docs[:args.num_docs_final]
