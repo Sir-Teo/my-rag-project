@@ -36,6 +36,8 @@ from src.indexing import build_faiss_index
 from src.reranking import get_reranker
 from src.rag_pipeline import answer_with_rag  # This function must handle a flexible "llm" callable.
 
+import warnings
+warnings.filterwarnings("ignore")
 
 def parse_args() -> argparse.Namespace:
     """
@@ -219,7 +221,6 @@ def get_hf_pipeline_llm(
         repetition_penalty=repetition_penalty,
         return_full_text=False,
         max_new_tokens=max_new_tokens,
-        device=device
     )
 
     def _hf_inference(prompt: str) -> str:

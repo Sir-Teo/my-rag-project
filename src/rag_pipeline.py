@@ -75,6 +75,6 @@ def answer_with_rag(
     final_prompt = template.format(context=context_str, question=question)
 
     # Step 4: get answer
-    output = llm(final_prompt)[0]["generated_text"]
+    output = output = llm(final_prompt)
 
     return output, doc_texts
