@@ -9,7 +9,7 @@ Example usage:
       --use_reranker \
       --use_vllm
 """
-
+import time
 import os
 import argparse
 import torch
@@ -36,8 +36,6 @@ from src.indexing import build_faiss_index
 from src.reranking import get_reranker
 from src.rag_pipeline import answer_with_rag  # This function must handle a flexible "llm" callable.
 from langchain_community.tools import DuckDuckGoSearchResults
-import warnings
-warnings.filterwarnings("ignore")
 from typing import Any
 
 def load_models_for_web(
@@ -320,13 +318,7 @@ def load_models(
 
 def main() -> None:
     """
-    Main execution function for the RAG pipeline:
-    1. Parse arguments
-    2. Load and process documents
-    3. Build embeddings and index
-    4. Load optional reranker + LLM (either HF pipeline or vLLM)
-    5. Generate RAG answer
-    6. Print result
+    Main execution function for the RAG pipeline with statistics reporting.
     """
     # Basic logger configuration
     logging.basicConfig(
@@ -336,88 +328,112 @@ def main() -> None:
     )
 
     args = parse_args()
+    start_total = time.time()
+    stats = {
+        'source': None,
+        'model': args.llm_model_name,
+        'retrieved_docs': 0,
+        'used_docs': 0,
+        'retrieval_time': 0.0,
+        'generation_time': 0.0,
+        'total_time': 0.0,
+        'reranker_used': args.use_reranker,
+        'vllm_used': args.use_vllm
+    }
 
     logging.info("Starting RAG pipeline...")
 
-    # 1. Load data and split into chunks
     if args.web:
         logging.info("Using web search for retrieval.")
+        stats['source'] = "web"
+        
         try:
-            from langchain_community.tools import DuckDuckGoSearchResults
-            from langchain_community.utilities import DuckDuckGoSearchAPIWrapper
+            # Web search implementation
+            start_retrieval = time.time()
+            
+            # Perform web search
+            search = DuckDuckGoSearchResults(
+                output_format="list"
+            )
+
+            search_results = search.invoke(args.question)
+            
+            processed_docs = [
+                {'content': content}
+                for doc in search_results
+                if (content := f"{doc['title']} {doc['snippet']}".strip())
+            ]
+            stats['retrieved_docs'] = len(processed_docs)
+
+            # Reranking
+            if args.use_reranker:
+                from src.reranking import get_reranker
+                reranker = get_reranker(args.reranker_model_name)
+                doc_contents = [doc['content'] for doc in processed_docs if doc['content'].strip()]
+                
+                if not doc_contents:
+                    logging.warning("No document content available for reranking.")
+                    used_docs = processed_docs[:args.num_docs_final]
+                else:
+                    reranked_results = reranker.rerank(args.question, doc_contents, k=args.num_docs_final)
+                    
+                    if not reranked_results:
+                        logging.warning("Reranker returned no results. Using original retrieved docs.")
+                        used_docs = processed_docs[:args.num_docs_final]
+                    else:
+                        reranked_indices = [result.document_id for result in reranked_results]
+                        used_docs = [processed_docs[i] for i in reranked_indices]
+            else:  # Handle case when reranker is not used
+                used_docs = processed_docs[:args.num_docs_final]
+
+            stats['used_docs'] = len(used_docs)
+            stats['retrieval_time'] = time.time() - start_retrieval
+
+            # Load LLM
+            if args.use_vllm:
+                llm_inference_fn = get_vllm_inference_fn(args.llm_model_name)
+            else:
+                llm_inference_fn = get_hf_pipeline_llm(args.llm_model_name)
+
+            # Generate answer
+            start_generation = time.time()
+            context = "\n\n".join([doc['content'] for doc in used_docs])
+            prompt = f"Question: {args.question}\nContext: {context}\nAnswer:"
+            answer = llm_inference_fn(prompt)
+            stats['generation_time'] = time.time() - start_generation
+
         except ImportError:
-            logging.error("Web search requires 'langchain-community' and 'duckduckgo-search'. Install with:")
+            logging.error("Web search requires additional packages:")
             logging.error("pip install langchain-community duckduckgo-search")
             sys.exit(1)
 
-        # Load models needed for web search
-        reranker, llm_inference_fn = load_models_for_web(
-            llm_model_name=args.llm_model_name,
-            use_vllm=args.use_vllm,
-            reranker_model_name=args.reranker_model_name if args.use_reranker else None,
-            use_reranker=args.use_reranker
-        )
-
-        # Perform web search
-        wrapper = DuckDuckGoSearchAPIWrapper(
-            max_results=args.num_retrieved_docs,
-            backend="web"
-        )
-        search = DuckDuckGoSearchResults(
-            api_wrapper=wrapper,
-            output_format="list"
-        )
-        search_results = search.invoke(args.question)
-
-        # Process into documents with 'content'
-        processed_docs = [
-            {'content': f"Title: {doc['title']}\nSnippet: {doc['snippet']}\nLink: {doc['link']}"}
-            for doc in search_results
-        ]
-
-        # Rerank if applicable
-        if args.use_reranker and reranker is not None:
-            doc_contents = [doc['content'] for doc in processed_docs]
-            reranked_indices = reranker.rerank(args.question, doc_contents, top_k=args.num_docs_final)
-            used_docs = [processed_docs[i] for i in reranked_indices]
-        else:
-            used_docs = processed_docs[:args.num_docs_final]
-
-        # Generate answer using LLM
-        context = "\n\n".join([doc['content'] for doc in used_docs])
-        prompt = (
-            f"Question: {args.question}\n"
-            f"Context: {context}\n"
-            "Answer the question based on the context. If unsure, state so."
-        )
-        answer = llm_inference_fn(prompt)
-
-        logging.info("\n" + "=" * 25 + " Web Search Answer " + "=" * 25)
-        logging.info(f"{answer}")
-        logging.info("=" * 63)
-
     else:
-        # Original RAG pipeline
+        # Dataset-based RAG implementation
+        stats['source'] = f"dataset ({args.dataset_path})"
+        start_retrieval = time.time()
+        
+        # Load and process documents
         docs_processed = load_and_process_documents(
-            dataset_path=args.dataset_path,
-            split=args.split,
-            embedding_model_name=args.embedding_model_name,
+            args.dataset_path,
+            args.split,
+            args.embedding_model_name
         )
-
-        # Load models (embedding, reranker, LLM)
+        
+        # Load models
         embedding_model, reranker, llm_inference_fn = load_models(
-            embedding_model_name=args.embedding_model_name,
-            llm_model_name=args.llm_model_name,
-            use_vllm=args.use_vllm,
-            reranker_model_name=args.reranker_model_name,
-            use_reranker=args.use_reranker
+            args.embedding_model_name,
+            args.llm_model_name,
+            args.use_vllm,
+            args.reranker_model_name,
+            args.use_reranker
         )
-
-        # Build FAISS index
-        logging.info("Building FAISS index...")
+        
+        # Build index
         knowledge_db = build_faiss_index(docs_processed, embedding_model)
+        stats['retrieval_time'] = time.time() - start_retrieval
 
-        # Run RAG pipeline
+        # Generate answer
+        start_generation = time.time()
         answer, used_docs = answer_with_rag(
             question=args.question,
             llm=llm_inference_fn,
@@ -427,16 +443,33 @@ def main() -> None:
             num_retrieved_docs=args.num_retrieved_docs,
             num_docs_final=args.num_docs_final
         )
+        stats['generation_time'] = time.time() - start_generation
+        stats['retrieved_docs'] = args.num_retrieved_docs
+        stats['used_docs'] = len(used_docs)
 
-        # Print result
-        logging.info("\n" + "=" * 25 + " RAG Answer " + "=" * 25)
-        logging.info(f"{answer}")
-        logging.info("=" * 63)
-
-    # If you want to see the final doc chunks used:
-    # for i, doc in enumerate(used_docs):
-    #     logging.info(f"[Doc {i}]: {doc}")
-
+    # Final statistics calculations
+    stats['total_time'] = time.time() - start_total
+    
+    # Print results
+    logging.info("\n" + "=" * 40 + " ANSWER " + "=" * 40)
+    logging.info(answer)
+    
+    logging.info("\n" + "=" * 40 + " STATISTICS " + "=" * 38)
+    logging.info(f"| {'Metric':<25} | {'Value':<50} |")
+    logging.info("|---------------------------|----------------------------------------------------|")
+    logging.info(f"| {'Data Source':<25} | {stats['source']:<50} |")
+    logging.info(f"| {'LLM Model':<25} | {stats['model']:<50} |")
+    logging.info(f"| {'Documents Retrieved':<25} | {stats['retrieved_docs']:<50} |")
+    logging.info(f"| {'Documents Used':<25} | {stats['used_docs']:<50} |")
+    logging.info(f"| {'Reranker Used':<25} | {'Yes' if stats['reranker_used'] else 'No':<50} |")
+    logging.info(f"| {'vLLM Acceleration':<25} | {'Yes' if stats['vllm_used'] else 'No':<50} |")
+    logging.info(f"| {'Retrieval Time (s)':<25} | {stats['retrieval_time']:.2f}{'*' if args.web else '':<49} |")
+    logging.info(f"| {'Generation Time (s)':<25} | {stats['generation_time']:.2f}{'*' if args.web else '':<49} |")
+    logging.info(f"| {'Total Time (s)':<25} | {stats['total_time']:.2f}{'*' if args.web else '':<49} |")
+    if args.web:
+        logging.info("| " + "-"*84 + " |")
+        logging.info("| * Web search timing breakdown includes different components than dataset RAG |")
+    logging.info("=" * 88 + "\n")
 
 if __name__ == "__main__":
     main()
